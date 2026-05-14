@@ -4,6 +4,7 @@ import { useEffect, useState } from 'react'
 import { useRouter } from 'next/navigation'
 import { createClient } from '@/lib/supabase/client'
 import Link from 'next/link'
+import * as XLSX from 'xlsx'
 
 interface Location {
   id: string
@@ -13,9 +14,24 @@ interface Location {
 interface Item {
   id: string
   name: string
+  category: string | null
+  brand: string | null
   unit: string
+  notes: string | null
   location_id: string
   locations: { name: string } | { name: string }[]
+}
+
+interface ImportedItemRow {
+  name: string
+  category: string
+  brand: string
+  unit: string
+  notes: string
+}
+
+interface ImportedWorkbookRow extends ImportedItemRow {
+  locationName: string
 }
 
 export default function ItemsPage() {
@@ -23,9 +39,15 @@ export default function ItemsPage() {
   const [locations, setLocations] = useState<Location[]>([])
   const [loading, setLoading] = useState(true)
   const [newItem, setNewItem] = useState('')
+  const [newCategory, setNewCategory] = useState('')
+  const [newBrand, setNewBrand] = useState('')
   const [newUnit, setNewUnit] = useState('count')
+  const [newNotes, setNewNotes] = useState('')
   const [newLocationId, setNewLocationId] = useState('')
+  const [importText, setImportText] = useState('')
+  const [importFileName, setImportFileName] = useState('')
   const [error, setError] = useState('')
+  const [importStatus, setImportStatus] = useState('')
   const router = useRouter()
   const supabase = createClient()
 
@@ -47,7 +69,7 @@ export default function ItemsPage() {
 
       const { data: itemData } = await supabase
         .from('items')
-        .select('id, name, unit, location_id, locations(name)')
+        .select('id, name, category, brand, unit, notes, location_id, locations(name)')
         .order('name', { ascending: true })
 
       setItems(itemData || [])
@@ -85,7 +107,10 @@ export default function ItemsPage() {
         .insert([
           {
             name: newItem.trim(),
+            category: newCategory.trim() || null,
+            brand: newBrand.trim() || null,
             unit: newUnit,
+            notes: newNotes.trim() || null,
             location_id: newLocationId,
             created_by: user.id,
           },
@@ -93,7 +118,10 @@ export default function ItemsPage() {
 
       if (insertError) throw insertError
       setNewItem('')
+      setNewCategory('')
+      setNewBrand('')
       setNewUnit('count')
+      setNewNotes('')
       fetchData()
     } catch (err) {
       console.error('Error adding item:', err)
@@ -115,6 +143,245 @@ export default function ItemsPage() {
     } catch (err) {
       console.error('Error deleting item:', err)
       setError('Failed to delete item')
+    }
+  }
+
+  const parseImportedItems = (rawText: string): ImportedItemRow[] => {
+    const rows = rawText
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0)
+
+    return rows
+      .map((row) => {
+        const parts = row.split(',').map((value) => value.trim())
+        
+        // Support multiple formats:
+        // 2-column: name,unit
+        // 3-column: name,category,unit
+        // 4-column: brand,item,unit,notes
+        if (parts.length === 2) {
+          return {
+            name: parts[0],
+            category: '',
+            brand: '',
+            unit: parts[1],
+            notes: '',
+          }
+        } else if (parts.length === 3) {
+          return {
+            name: parts[0],
+            category: parts[1],
+            brand: '',
+            unit: parts[2],
+            notes: '',
+          }
+        } else if (parts.length >= 4) {
+          return {
+            brand: parts[0],
+            name: parts[1],
+            unit: parts[2],
+            notes: parts[3],
+            category: '',
+          }
+        }
+        
+        return { name: '', category: '', brand: '', unit: '', notes: '' }
+      })
+      .filter((row) => row.name && row.unit)
+  }
+
+  const inferFirstValue = (row: string[], indexes: number[]) => {
+    for (const index of indexes) {
+      const value = row[index]?.trim()
+      if (value) {
+        return value
+      }
+    }
+
+    return ''
+  }
+
+  const parseWorkbook = async (file: File): Promise<ImportedWorkbookRow[]> => {
+    const buffer = await file.arrayBuffer()
+    const workbook = XLSX.read(buffer, { type: 'array' })
+    const importedRows: ImportedWorkbookRow[] = []
+
+    workbook.SheetNames.forEach((sheetName) => {
+      const worksheet = workbook.Sheets[sheetName]
+      const rows = XLSX.utils.sheet_to_json<string[]>(worksheet, {
+        header: 1,
+        blankrows: false,
+        defval: '',
+      })
+
+      if (rows.length === 0) {
+        return
+      }
+
+      const header = rows[0].map((value) => String(value).trim().toLowerCase())
+      const hasHeaders = header.some((cell) =>
+        ['brand', 'item', 'item description', 'description', 'name', 'category', 'categories', 'unit', 'size/unit', 'size unit', 'size', 'notes', 'note'].includes(cell)
+      )
+
+      // Detect column indices
+      const brandIndex = hasHeaders
+        ? header.findIndex((cell) => ['brand', 'supplier', 'vendor'].includes(cell))
+        : 0
+      const itemIndex = hasHeaders
+        ? header.findIndex((cell) => ['item', 'item description', 'description', 'name'].includes(cell))
+        : 1
+      const unitIndex = hasHeaders
+        ? header.findIndex((cell) => ['unit', 'size/unit', 'size unit', 'size', 'pack size'].includes(cell))
+        : 2
+      const notesIndex = hasHeaders
+        ? header.findIndex((cell) => ['notes', 'note', 'remarks', 'comments'].includes(cell))
+        : 3
+
+      const dataRows = hasHeaders ? rows.slice(1) : rows
+
+      dataRows.forEach((row) => {
+        const brand = inferFirstValue(row, brandIndex >= 0 ? [brandIndex, 0] : [0])
+        const name = inferFirstValue(row, itemIndex >= 0 ? [itemIndex, 1] : [1])
+        const unit = inferFirstValue(row, unitIndex >= 0 ? [unitIndex, 2, 1] : [2, 1])
+        const notes = inferFirstValue(row, notesIndex >= 0 ? [notesIndex, 3] : [3])
+
+        if (name && unit) {
+          importedRows.push({
+            locationName: sheetName.trim(),
+            brand,
+            name,
+            unit,
+            notes,
+            category: '',
+          })
+        }
+      })
+    })
+
+    return importedRows
+  }
+
+  const handleImportItems = async (e: React.FormEvent) => {
+    e.preventDefault()
+    setError('')
+    setImportStatus('')
+
+    if (!importText.trim()) {
+      setError('Paste item rows before importing')
+      return
+    }
+
+    if (!newLocationId) {
+      setError('Please select a location before importing')
+      return
+    }
+
+    const importedRows = parseImportedItems(importText)
+
+    if (importedRows.length === 0) {
+      setError('No valid item rows found. Use: name,unit or name,category,unit or brand,item,unit,notes (one item per line)')
+      return
+    }
+
+    try {
+      const { data: { user } } = await supabase.auth.getUser()
+
+      if (!user) {
+        router.push('/login')
+        return
+      }
+
+      const payload = importedRows.map((row) => ({
+        name: row.name,
+        category: row.category || null,
+        brand: row.brand || null,
+        unit: row.unit,
+        notes: row.notes || null,
+        location_id: newLocationId,
+        created_by: user.id,
+      }))
+
+      const { error: importError } = await supabase.from('items').insert(payload)
+
+      if (importError) throw importError
+
+      setImportText('')
+      setImportStatus(`✓ Imported ${payload.length} item${payload.length === 1 ? '' : 's'}. Each item retained its own unit and category.`)
+      fetchData()
+    } catch (err) {
+      console.error('Error importing items:', err)
+      setError('Failed to import items')
+    }
+  }
+
+  const handleWorkbookImport = async (file: File) => {
+    setError('')
+    setImportStatus('')
+
+    try {
+      const { data: { user } } = await supabase.auth.getUser()
+
+      if (!user) {
+        router.push('/login')
+        return
+      }
+
+      const workbookRows = await parseWorkbook(file)
+
+      if (workbookRows.length === 0) {
+        setError('No usable rows found in workbook')
+        return
+      }
+
+      const { data: locationRows, error: locationFetchError } = await supabase
+        .from('locations')
+        .select('id, name')
+
+      if (locationFetchError) throw locationFetchError
+
+      const locationMap = new Map(
+        (locationRows || []).map((location) => [location.name.toLowerCase(), location.id])
+      )
+
+      for (const row of workbookRows) {
+        let locationId = locationMap.get(row.locationName.toLowerCase())
+
+        if (!locationId) {
+          const { data: createdLocation, error: createLocationError } = await supabase
+            .from('locations')
+            .insert({
+              name: row.locationName,
+              created_by: user.id,
+            })
+            .select('id, name')
+            .single()
+
+          if (createLocationError) throw createLocationError
+
+          locationId = createdLocation.id
+          locationMap.set(createdLocation.name.toLowerCase(), createdLocation.id)
+        }
+
+        const { error: itemError } = await supabase.from('items').insert({
+          name: row.name,
+          category: row.category || null,
+          brand: row.brand || null,
+          unit: row.unit,
+          notes: row.notes || null,
+          location_id: locationId,
+          created_by: user.id,
+        })
+
+        if (itemError) throw itemError
+      }
+
+      setImportFileName(file.name)
+      setImportStatus(`Imported ${workbookRows.length} item${workbookRows.length === 1 ? '' : 's'} from ${file.name}`)
+      fetchData()
+    } catch (err) {
+      console.error('Error importing workbook:', err)
+      setError('Failed to import workbook')
     }
   }
 
@@ -141,6 +408,12 @@ export default function ItemsPage() {
           </div>
         )}
 
+        {importStatus && (
+          <div className="bg-green-50 border border-green-200 text-green-800 px-4 py-3 rounded mb-6">
+            {importStatus}
+          </div>
+        )}
+
         {locations.length === 0 ? (
           <div className="bg-yellow-50 border border-yellow-200 text-yellow-800 px-4 py-3 rounded mb-6">
             Please create locations first before adding items.
@@ -161,6 +434,20 @@ export default function ItemsPage() {
                     onChange={(e) => setNewItem(e.target.value)}
                     className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500"
                     placeholder="e.g., Chicken Breast"
+                  />
+                </div>
+
+                <div>
+                  <label htmlFor="category" className="block text-sm font-medium text-gray-700 mb-1">
+                    Category
+                  </label>
+                  <input
+                    id="category"
+                    type="text"
+                    value={newCategory}
+                    onChange={(e) => setNewCategory(e.target.value)}
+                    className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500"
+                    placeholder="e.g., Proteins"
                   />
                 </div>
 
@@ -202,6 +489,36 @@ export default function ItemsPage() {
                 </div>
               </div>
 
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div>
+                  <label htmlFor="brand" className="block text-sm font-medium text-gray-700 mb-1">
+                    Brand
+                  </label>
+                  <input
+                    id="brand"
+                    type="text"
+                    value={newBrand}
+                    onChange={(e) => setNewBrand(e.target.value)}
+                    className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500"
+                    placeholder="e.g., Tyson"
+                  />
+                </div>
+
+                <div>
+                  <label htmlFor="notes" className="block text-sm font-medium text-gray-700 mb-1">
+                    Notes
+                  </label>
+                  <input
+                    id="notes"
+                    type="text"
+                    value={newNotes}
+                    onChange={(e) => setNewNotes(e.target.value)}
+                    className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500"
+                    placeholder="e.g., Bulk purchase"
+                  />
+                </div>
+              </div>
+
               <button
                 type="submit"
                 className="bg-indigo-600 hover:bg-indigo-700 text-white font-semibold py-2 px-4 rounded"
@@ -209,6 +526,82 @@ export default function ItemsPage() {
                 Add Item
               </button>
             </form>
+          </div>
+        )}
+
+        {locations.length > 0 && (
+          <div className="bg-white rounded-lg shadow p-6 mb-8">
+            <h2 className="text-xl font-semibold text-gray-800 mb-2">Import Items</h2>
+            <p className="text-sm text-gray-600 mb-4">
+              Paste one item per line. Each item can have its own brand, unit, and notes. Use format:
+              <br/>
+              <span className="font-medium">name,unit</span> or 
+              <span className="font-medium"> name,category,unit</span> or 
+              <span className="font-medium"> brand,item,unit,notes</span>
+            </p>
+            <form onSubmit={handleImportItems} className="space-y-4">
+              <div>
+                <label htmlFor="import-location" className="block text-sm font-medium text-gray-700 mb-1">
+                  Import Into Location
+                </label>
+                <select
+                  id="import-location"
+                  value={newLocationId}
+                  onChange={(e) => setNewLocationId(e.target.value)}
+                  className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500"
+                >
+                  {locations.map((loc) => (
+                    <option key={loc.id} value={loc.id}>
+                      {loc.name}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              <div>
+                <label htmlFor="import-text" className="block text-sm font-medium text-gray-700 mb-1">
+                  Item Rows
+                </label>
+                <textarea
+                  id="import-text"
+                  value={importText}
+                  onChange={(e) => setImportText(e.target.value)}
+                  className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 font-mono text-sm"
+                  rows={8}
+                  placeholder={"Examples:\nChicken Breast,lbs\nRice,Grains,boxes\nTyson,Chicken Breast,lbs,Bulk purchase\nMilk,Dairy,gallons"}
+                />
+              </div>
+
+              <button
+                type="submit"
+                className="bg-emerald-600 hover:bg-emerald-700 text-white font-semibold py-2 px-4 rounded"
+              >
+                Import Items
+              </button>
+            </form>
+
+            <div className="mt-6 border-t pt-6">
+              <label htmlFor="workbook-import" className="block text-sm font-medium text-gray-700 mb-2">
+                Upload Excel Workbook
+              </label>
+              <input
+                id="workbook-import"
+                type="file"
+                accept=".xlsx,.xls"
+                onChange={(e) => {
+                  const file = e.target.files?.[0]
+                  if (!file) {
+                    return
+                  }
+
+                  void handleWorkbookImport(file)
+                }}
+                className="block w-full text-sm text-gray-700 file:mr-4 file:rounded-lg file:border-0 file:bg-slate-900 file:px-4 file:py-2 file:text-white hover:file:bg-slate-700"
+              />
+              <p className="mt-2 text-xs text-gray-500">
+                Each sheet name becomes a location. The system looks for columns: Brand, Item, Unit, Notes. Column order is flexible.
+              </p>
+            </div>
           </div>
         )}
 
@@ -222,7 +615,10 @@ export default function ItemsPage() {
                 <thead className="bg-gray-100 border-b">
                   <tr>
                     <th className="px-6 py-3 text-left text-sm font-semibold text-gray-700">Name</th>
+                    <th className="px-6 py-3 text-left text-sm font-semibold text-gray-700">Brand</th>
+                    <th className="px-6 py-3 text-left text-sm font-semibold text-gray-700">Category</th>
                     <th className="px-6 py-3 text-left text-sm font-semibold text-gray-700">Unit</th>
+                    <th className="px-6 py-3 text-left text-sm font-semibold text-gray-700">Notes</th>
                     <th className="px-6 py-3 text-left text-sm font-semibold text-gray-700">Location</th>
                     <th className="px-6 py-3 text-left text-sm font-semibold text-gray-700">Actions</th>
                   </tr>
@@ -231,7 +627,10 @@ export default function ItemsPage() {
                   {items.map((item) => (
                     <tr key={item.id} className="border-b hover:bg-gray-50">
                       <td className="px-6 py-3 text-gray-800">{item.name}</td>
+                      <td className="px-6 py-3 text-gray-600">{item.brand || '—'}</td>
+                      <td className="px-6 py-3 text-gray-600">{item.category || '—'}</td>
                       <td className="px-6 py-3 text-gray-600">{item.unit}</td>
+                      <td className="px-6 py-3 text-gray-600 text-xs max-w-xs truncate">{item.notes || '—'}</td>
                       <td className="px-6 py-3 text-gray-600">
                         {Array.isArray(item.locations)
                           ? item.locations[0]?.name
